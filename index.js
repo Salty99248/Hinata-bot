@@ -11,6 +11,8 @@ const {
     DisconnectReason,
     fetchLatestBaileysVersion,
     downloadMediaMessage,
+    generateWAMessageFromContent,
+    prepareWAMessageMedia,
     Browsers
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -344,7 +346,7 @@ async function iniciarBot() {
                 db.owners.push(botNum);
             }
             salvarDB(db);
-            console.log('🌸 Hinata Bot + IA Conectada! Donos:', db.owners.join(', '), '| Prefixo:', db.prefix);
+            console.log('🌸 Hinata Bot + IA + Sticker c/ Som Conectada! Donos:', db.owners.join(', '), '| Prefixo:', db.prefix);
         }
     });
 
@@ -432,14 +434,21 @@ async function iniciarBot() {
             return sock.sendMessage(from, { text: txt, mentions }, { quoted: m });
         };
 
+        // ==========================================
+        // DOWNLOAD MP3 E MP4 OTIMIZADO PARA TERMUX E WINDOWS
+        // ==========================================
         async function processarDownload(url, formato) {
+            const termuxBin = '/data/data/com.termux/files/usr/bin';
+            const flagFfmpeg = fs.existsSync(termuxBin) ? `--ffmpeg-location "${termuxBin}" ` : '';
+
             if (formato === 'mp3') {
                 await responder('🎵 Baixando e convertendo para *MP3 (Musica)*, aguarde...');
                 const outA = path.join(__dirname, 'aud_' + Date.now() + '.mp3');
-                const dlCmd = 'yt-dlp -x --audio-format mp3 --max-filesize 50M -o "' + outA + '" "' + url + '"';
+                const dlCmd = `yt-dlp ${flagFfmpeg}--extractor-args "youtube:player_client=android" -x --audio-format mp3 --max-filesize 50M -o "${outA}" "${url}"`;
 
-                exec(dlCmd, async (err) => {
+                exec(dlCmd, async (err, stdout, stderr) => {
                     if (err || !fs.existsSync(outA)) {
+                        console.log('Erro yt-dlp mp3:', stderr || err?.message);
                         return responder('❌ Erro ao baixar o audio. Verifique se o link e publico e valido.');
                     }
                     try {
@@ -456,10 +465,11 @@ async function iniciarBot() {
             } else {
                 await responder('🎬 Baixando *Video (MP4)*, aguarde...');
                 const outV = path.join(__dirname, 'vid_' + Date.now() + '.mp4');
-                const dlCmd = 'yt-dlp -f "best[ext=mp4]/best" --max-filesize 50M -o "' + outV + '" "' + url + '"';
+                const dlCmd = `yt-dlp ${flagFfmpeg}--extractor-args "youtube:player_client=android" -f "best[ext=mp4][height<=720]/best[ext=mp4]/best" --max-filesize 50M -o "${outV}" "${url}"`;
 
-                exec(dlCmd, async (err) => {
+                exec(dlCmd, async (err, stdout, stderr) => {
                     if (err || !fs.existsSync(outV)) {
+                        console.log('Erro yt-dlp mp4:', stderr || err?.message);
                         return responder('❌ Erro ao baixar o video. Verifique se o link e publico e valido.');
                     }
                     try {
@@ -505,26 +515,47 @@ async function iniciarBot() {
         }
 
         // ==========================================
-        // SISTEMA ANTI-LINK AUTOMATICO (GRUPOS)
+        // SISTEMA ANTI-LINK BLINDADO (INCLUI CASSINOS, LEGENDAS E ENCURTADORES)
         // ==========================================
-        if (isGroup && texto && groupCfg.antilink) {
-            const regexLink = /(https?:\/\/[^\s]+|www\.[^\s]+|chat\.whatsapp\.com\/[^\s]+|t\.me\/[^\s]+|\b[a-zA-Z0-9-]+\.(com|net|org|xyz|bet|casino|vip|top|br|io|app)\b(\/[^\s]*)?)/i;
-            const txtLimpo = texto.trim().toLowerCase();
+        const textoCompletoAntiLink = [
+            texto,
+            m.message.imageMessage?.caption,
+            m.message.videoMessage?.caption,
+            m.message.documentMessage?.caption,
+            m.message.extendedTextMessage?.matchedText,
+            m.message.extendedTextMessage?.canonicalUrl,
+            m.message.extendedTextMessage?.title,
+            m.message.extendedTextMessage?.description
+        ].filter(Boolean).join(' ');
+
+        if (isGroup && textoCompletoAntiLink && groupCfg.antilink) {
+            const textoNormalizado = textoCompletoAntiLink
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .toLowerCase();
+
+            const regexLinkGeral = /(https?:\/\/|www\.|chat\.whatsapp\.com\/|wa\.me\/|t\.me\/|bit\.ly\/|tinyurl\.com\/|linktr\.ee\/|[a-z0-9-]+\s*\.\s*(com|net|org|xyz|bet|casino|cassino|vip|top|br|io|app|online|site|win|club|fun|click|link|pro|live|game|games|play|slot|slots)\b)/i;
+            const regexSpamCassino = /(plataforma\s+(nova|pagando)|link\s+na\s+bio|cadastre-?se\s+e\s+ganhe|bonus\s+de\s+cadastro|fortune\s+tiger|jogo\s+do\s+tigrinho|saque\s+rapido\s+via\s+pix)/i;
+
+            const txtLimpo = textoNormalizado.trim();
             const ehComandoBaixar = txtLimpo.startsWith(p + 'baixar') || txtLimpo.startsWith(p + 'dl') || txtLimpo.startsWith(p + 'mp3') || txtLimpo.startsWith(p + 'mp4') || txtLimpo.startsWith(p + 'musica');
 
-            if (regexLink.test(texto) && !ehComandoBaixar) {
+            if ((regexLinkGeral.test(textoNormalizado) || regexSpamCassino.test(textoNormalizado)) && !ehComandoBaixar) {
                 const { isSenderAdmin } = await verificarAdms();
                 if (!isSenderAdmin) {
                     try {
                         await sock.sendMessage(from, { delete: m.key });
+                    } catch (e) {}
+
+                    try {
                         await sock.groupParticipantsUpdate(from, [sender], 'remove');
                         await sock.sendMessage(from, {
-                            text: '🚫 *ANTI-LINK ATIVADO!*\n@' + senderNum + ' enviou link sem ser ADM e foi banido automaticamente.',
+                            text: '🚫 *ANTI-LINK / ANTI-CASSINO ATIVADO!*\n@' + senderNum + ' enviou link ou divulgação proibida e foi banido imediatamente.',
                             mentions: [sender]
                         });
                     } catch (errBan) {
                         await sock.sendMessage(from, {
-                            text: '⚠️ @' + senderNum + ' enviou um link proibido! (Verifique se eu estou como Administradora do grupo para poder remover).',
+                            text: '⚠️ @' + senderNum + ' enviou link proibido! (Coloque a Hinata Bot como Administradora do grupo para banir automaticamente).',
                             mentions: [sender]
                         }, { quoted: m });
                     }
@@ -556,7 +587,6 @@ async function iniciarBot() {
             }
 
             if (!m.key.fromMe && texto && groupCfg.autoResp) {
-                // 1. Verifica primeiro se existe uma resposta personalizada criada com ,addresp
                 if (groupCfg.customResps && Object.keys(groupCfg.customResps).length > 0) {
                     for (const [gatilho, respostaSalva] of Object.entries(groupCfg.customResps)) {
                         if (txtLow === gatilho || txtLow.includes(gatilho)) {
@@ -565,7 +595,6 @@ async function iniciarBot() {
                     }
                 }
 
-                // 2. Respostas automaticas fixas de saudacao
                 if (txtLow === 'oi bot' || txtLow === 'ola bot' || txtLow === 'bot') {
                     const frases = [
                         '🌸 Oi! Eu sou a Hinata Bot! Digite *' + p + 'menu* para ver meus comandos.',
@@ -600,7 +629,6 @@ async function iniciarBot() {
                     const autorRespondido = ctxInfo?.participant || '';
                     const respondeuAoBot = mesmoUsuario(autorRespondido, botId) || (botLid && mesmoUsuario(autorRespondido, botLid));
 
-                    // Aprende com as conversas dos membros
                     if (ehValidoParaAprender) {
                         if (msgRespondida && !respondeuAoBot && msgRespondida.length >= 3 && msgRespondida.length <= 120 && !msgRespondida.startsWith(p)) {
                             const chavePergunta = msgRespondida.trim().toLowerCase();
@@ -617,7 +645,6 @@ async function iniciarBot() {
                         }
                     }
 
-                    // Decide se vai responder sozinha
                     const chamouHinata = txtLow.includes('hinata');
                     const sorteioChance = (Math.random() * 100) < (groupCfg.iaChance || 25);
 
@@ -666,7 +693,7 @@ async function iniciarBot() {
             const txt = [
                 '🌸 *HINATA BOT - MENU* 🌸 (Prefixo: *' + p + '*)',
                 '',
-                '🧠 *INTELIGENCIA E APRENDIZADO (NOVO!):*',
+                '🧠 *INTELIGENCIA E APRENDIZADO:*',
                 '├ *' + p + 'ia on/off* - Liga/desliga aprendizado de falas',
                 '├ *' + p + 'ia chance <1-100>* - Chance de falar sozinha',
                 '├ *' + p + 'cerebro* - Mostra quantas falas ja aprendeu',
@@ -697,7 +724,8 @@ async function iniciarBot() {
                 '',
                 '📥 *DOWNLOADS E FIGURINHAS:*',
                 '├ *' + p + 'baixar <link>* - Escolher 1 (Video) ou 2 (Musica)',
-                '├ *' + p + 's* | *' + p + 'addfig* | *' + p + 'fig <1-10>* (' + totalFigs + ' salvas)',
+                '├ *' + p + 's* | *' + p + 'ssom* (Figurinha c/ áudio 🔊)',
+                '├ *' + p + 'addfig* | *' + p + 'fig <1-10>* (' + totalFigs + ' salvas)',
                 '└ *' + p + 'velha [@user]* / *' + p + 'jogar <1-9>* - Jogo da Velha',
                 '',
                 '🛡️ *BOAS-VINDAS, AUTO-RESPOSTAS E MODERACAO:*',
@@ -1794,56 +1822,23 @@ async function iniciarBot() {
             }
         }
 
-      // ==========================================
-        // SISTEMA ANTI-LINK BLINDADO (INCLUI CASSINOS, LEGENDAS E ENCURTADORES)
-        // ==========================================
-        const textoCompletoAntiLink = [
-            texto,
-            m.message.imageMessage?.caption,
-            m.message.videoMessage?.caption,
-            m.message.documentMessage?.caption,
-            m.message.extendedTextMessage?.matchedText,
-            m.message.extendedTextMessage?.canonicalUrl,
-            m.message.extendedTextMessage?.title,
-            m.message.extendedTextMessage?.description
-        ].filter(Boolean).join(' ');
+        if (cmd === 'antilink') {
+            if (!isGroup) return responder('⚠️ Este comando so funciona dentro de grupos.');
+            const { isSenderAdmin } = await verificarAdms();
+            if (!isSenderAdmin) return responder('🔒 Apenas ADMs do grupo ou os Donos podem configurar o Anti-Link.');
 
-        if (isGroup && textoCompletoAntiLink && groupCfg.antilink) {
-            const textoNormalizado = textoCompletoAntiLink
-                .normalize('NFD')
-                .replace(/[\u0300-\u036f]/g, '')
-                .toLowerCase();
-
-            // Pega qualquer URL, dominio (.bet, .win, .online, .site, .club, .xyz, .top, .vip, .com, .br, etc.) ou encurtador
-            const regexLinkGeral = /(https?:\/\/|www\.|chat\.whatsapp\.com\/|wa\.me\/|t\.me\/|bit\.ly\/|tinyurl\.com\/|linktr\.ee\/|[a-z0-9-]+\s*\.\s*(com|net|org|xyz|bet|casino|cassino|vip|top|br|io|app|online|site|win|club|fun|click|link|pro|live|game|games|play|slot|slots)\b)/i;
-
-            // Bloqueia tambem divulgacao classica de plataforma/tigrinho mesmo se tentarem disfarcar o link
-            const regexSpamCassino = /(plataforma\s+(nova|pagando)|link\s+na\s+bio|cadastre-?se\s+e\s+ganhe|bonus\s+de\s+cadastro|fortune\s+tiger|jogo\s+do\s+tigrinho|saque\s+rapido\s+via\s+pix)/i;
-
-            const txtLimpo = textoNormalizado.trim();
-            const ehComandoBaixar = txtLimpo.startsWith(p + 'baixar') || txtLimpo.startsWith(p + 'dl') || txtLimpo.startsWith(p + 'mp3') || txtLimpo.startsWith(p + 'mp4') || txtLimpo.startsWith(p + 'musica');
-
-            if ((regexLinkGeral.test(textoNormalizado) || regexSpamCassino.test(textoNormalizado)) && !ehComandoBaixar) {
-                const { isSenderAdmin } = await verificarAdms();
-                if (!isSenderAdmin) {
-                    try {
-                        await sock.sendMessage(from, { delete: m.key });
-                    } catch (e) {}
-
-                    try {
-                        await sock.groupParticipantsUpdate(from, [sender], 'remove');
-                        await sock.sendMessage(from, {
-                            text: '🚫 *ANTI-LINK / ANTI-CASSINO ATIVADO!*\n@' + senderNum + ' enviou link ou divulgação proibida e foi banido imediatamente.',
-                            mentions: [sender]
-                        });
-                    } catch (errBan) {
-                        await sock.sendMessage(from, {
-                            text: '⚠️ @' + senderNum + ' enviou link proibido! (Coloque a Hinata Bot como Administradora do grupo para banir automaticamente).',
-                            mentions: [sender]
-                        }, { quoted: m });
-                    }
-                    return;
-                }
+            const opcao = (args[0] || '').toLowerCase();
+            if (opcao === 'on' || opcao === 'ligar' || opcao === '1') {
+                groupCfg.antilink = true;
+                salvarDB(db);
+                return responder('🛡️ *Anti-Link ATIVADO!* Membros comuns que enviarem links serao banidos.');
+            } else if (opcao === 'off' || opcao === 'desligar' || opcao === '0') {
+                groupCfg.antilink = false;
+                salvarDB(db);
+                return responder('🔓 *Anti-Link DESATIVADO* neste grupo.');
+            } else {
+                const statusAtual = groupCfg.antilink ? 'ATIVADO ✅' : 'DESATIVADO ❌';
+                return responder('🛡️ Status do Anti-Link: *' + statusAtual + '*\nUse *' + p + 'antilink on* ou *' + p + 'antilink off*.');
             }
         }
 
@@ -2436,7 +2431,7 @@ async function iniciarBot() {
         }
 
         // ==========================================
-        // JOGO DA VELHA (!velha e !jogar)
+        // JOGO DA VELHA (,velha e ,jogar)
         // ==========================================
         if (cmd === 'velha' || cmd === 'ttt') {
             if (args[0] === 'sair' || args[0] === 'fim') {
@@ -2520,7 +2515,7 @@ async function iniciarBot() {
         }
 
         // ==========================================
-        // PACK DE FIGURINHAS (!addfig e !fig)
+        // PACK DE FIGURINHAS (,addfig e ,fig)
         // ==========================================
         if (cmd === 'addfig') {
             const quoted = m.message.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -2558,7 +2553,74 @@ async function iniciarBot() {
         }
 
         // ==========================================
-        // CRIAR FIGURINHA (!s) E DOWNLOAD INTERATIVO (!baixar, !mp3, !mp4)
+        // CRIAR FIGURINHA NATIVA COM SOM (,ssom / ,stickersom)
+        // ==========================================
+        if (cmd === 'ssom' || cmd === 'stickersom' || cmd === 'figsom') {
+            const quoted = m.message.extendedTextMessage?.contextInfo?.quotedMessage;
+            const targetMsg = quoted ? { message: quoted } : m;
+            const targetType = quoted ? Object.keys(quoted)[0] : tipoMsg;
+
+            if (targetType === 'videoMessage') {
+                await responder('⏳ Criando figurinha nativa com som...');
+                try {
+                    const buf = await downloadMediaMessage(targetMsg, 'buffer', {});
+                    const ts = Date.now();
+                    const inP = path.join(__dirname, 'in_som_' + ts + '.mp4');
+                    const outMp4 = path.join(__dirname, 'out_som_' + ts + '.mp4');
+                    fs.writeFileSync(inP, buf);
+
+                    const filtro = 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black';
+                    const cmdSom = 'ffmpeg -y -i "' + inP + '" -t 8 -vf "' + filtro + ',fps=20" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -c:a aac -b:a 96k -movflags +faststart "' + outMp4 + '"';
+
+                    exec(cmdSom, async (err) => {
+                        if (fs.existsSync(inP)) fs.unlinkSync(inP);
+                        if (err || !fs.existsSync(outMp4)) {
+                            return responder('❌ Erro ao converter o vídeo com áudio.');
+                        }
+
+                        try {
+                            const mediaUpload = await prepareWAMessageMedia(
+                                { video: fs.readFileSync(outMp4) },
+                                { upload: sock.waUploadToServer }
+                            );
+
+                            const vidInfo = mediaUpload.videoMessage;
+
+                            const waMsg = generateWAMessageFromContent(from, {
+                                stickerMessage: {
+                                    url: vidInfo.url,
+                                    fileSha256: vidInfo.fileSha256,
+                                    fileEncSha256: vidInfo.fileEncSha256,
+                                    mediaKey: vidInfo.mediaKey,
+                                    mimetype: 'video/mp4',
+                                    height: 512,
+                                    width: 512,
+                                    directPath: vidInfo.directPath,
+                                    fileLength: vidInfo.fileLength,
+                                    mediaKeyTimestamp: vidInfo.mediaKeyTimestamp,
+                                    isAnimated: true
+                                }
+                            }, { quoted: m });
+
+                            await sock.relayMessage(from, waMsg.message, { messageId: waMsg.key.id });
+                        } catch (eRelay) {
+                            console.log('Erro relay sticker com som:', eRelay);
+                            await responder('❌ Falha ao transmitir a figurinha com som.');
+                        } finally {
+                            if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4);
+                        }
+                    });
+                } catch (e) {
+                    await responder('❌ Falha ao baixar o vídeo.');
+                }
+            } else {
+                await responder('⚠️ Envie ou responda a um *vídeo* com *' + p + 'ssom*!');
+            }
+            return;
+        }
+
+        // ==========================================
+        // CRIAR FIGURINHA NORMAL (,s) E DOWNLOAD INTERATIVO (,baixar, ,mp3, ,mp4)
         // ==========================================
         if (cmd === 's' || cmd === 'sticker') {
             const quoted = m.message.extendedTextMessage?.contextInfo?.quotedMessage;
