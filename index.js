@@ -2555,69 +2555,82 @@ async function iniciarBot() {
         // ==========================================
         // CRIAR FIGURINHA NATIVA COM SOM (,ssom / ,stickersom)
         // ==========================================
-        if (cmd === 'ssom' || cmd === 'stickersom' || cmd === 'figsom') {
-            const quoted = m.message.extendedTextMessage?.contextInfo?.quotedMessage;
-            const targetMsg = quoted ? { message: quoted } : m;
-            const targetType = quoted ? Object.keys(quoted)[0] : tipoMsg;
+        // ==========================================
+     // CRIAR FIGURINHA NATIVA COM SOM (,ssom / ,stickersom)
+     // ==========================================
+     if (cmd === 'ssom' || cmd === 'stickersom' || cmd === 'figsom') {
+         const quoted = m.message.extendedTextMessage?.contextInfo?.quotedMessage;
+         const targetMsg = quoted ? { key: m.key, message: quoted } : m;
+         const targetType = quoted ? Object.keys(quoted)[0] : tipoMsg;
 
-            if (targetType === 'videoMessage') {
-                await responder('⏳ Criando figurinha nativa com som...');
-                try {
-                    const buf = await downloadMediaMessage(targetMsg, 'buffer', {});
-                    const ts = Date.now();
-                    const inP = path.join(__dirname, 'in_som_' + ts + '.mp4');
-                    const outMp4 = path.join(__dirname, 'out_som_' + ts + '.mp4');
-                    fs.writeFileSync(inP, buf);
+         if (targetType !== 'videoMessage') {
+             return responder('⚠️ Envie ou responda a um *vídeo* com *' + p + 'ssom*!');
+         }
 
-                    const filtro = 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black';
-                    const cmdSom = 'ffmpeg -y -i "' + inP + '" -t 8 -vf "' + filtro + ',fps=20" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -c:a aac -b:a 96k -movflags +faststart "' + outMp4 + '"';
+         if (downloadsPendentes['ssom_' + sender]) {
+             return responder('⏳ Já estou processando sua figurinha com som, aguarde terminar!');
+         }
+         downloadsPendentes['ssom_' + sender] = true;
 
-                    exec(cmdSom, async (err) => {
-                        if (fs.existsSync(inP)) fs.unlinkSync(inP);
-                        if (err || !fs.existsSync(outMp4)) {
-                            return responder('❌ Erro ao converter o vídeo com áudio.');
-                        }
+         await responder('⏳ Criando figurinha nativa com som...');
+         try {
+             const buf = await downloadMediaMessage(targetMsg, 'buffer', {});
+             const ts = Date.now();
+             const inP = path.join(__dirname, 'in_som_' + ts + '.mp4');
+             const outMp4 = path.join(__dirname, 'out_som_' + ts + '.mp4');
+             fs.writeFileSync(inP, buf);
 
-                        try {
-                            const mediaUpload = await prepareWAMessageMedia(
-                                { video: fs.readFileSync(outMp4) },
-                                { upload: sock.waUploadToServer }
-                            );
+             // Resolucao 360x360 e 2 threads para converter rapido no Termux (ARMv7)
+             const filtro = 'scale=360:360:force_original_aspect_ratio=decrease,pad=360:360:(ow-iw)/2:(oh-ih)/2:color=black';
+             const cmdSom = `ffmpeg -y -i "${inP}" -t 7 -vf "${filtro},fps=15" -c:v libx264 -preset ultrafast -crf 30 -threads 2 -pix_fmt yuv420p -c:a aac -b:a 64k -movflags +faststart "${outMp4}"`;
 
-                            const vidInfo = mediaUpload.videoMessage;
+             exec(cmdSom, { timeout: 45000 }, async (err, stdout, stderr) => {
+                 delete downloadsPendentes['ssom_' + sender];
+                 if (fs.existsSync(inP)) fs.unlinkSync(inP);
 
-                            const waMsg = generateWAMessageFromContent(from, {
-                                stickerMessage: {
-                                    url: vidInfo.url,
-                                    fileSha256: vidInfo.fileSha256,
-                                    fileEncSha256: vidInfo.fileEncSha256,
-                                    mediaKey: vidInfo.mediaKey,
-                                    mimetype: 'video/mp4',
-                                    height: 512,
-                                    width: 512,
-                                    directPath: vidInfo.directPath,
-                                    fileLength: vidInfo.fileLength,
-                                    mediaKeyTimestamp: vidInfo.mediaKeyTimestamp,
-                                    isAnimated: true
-                                }
-                            }, { quoted: m });
+                 if (err || !fs.existsSync(outMp4)) {
+                     console.log('Erro FFmpeg ssom:', stderr || err?.message);
+                     return responder('❌ Erro ao converter vídeo: ' + (err?.message || 'arquivo não gerado'));
+                 }
 
-                            await sock.relayMessage(from, waMsg.message, { messageId: waMsg.key.id });
-                        } catch (eRelay) {
-                            console.log('Erro relay sticker com som:', eRelay);
-                            await responder('❌ Falha ao transmitir a figurinha com som.');
-                        } finally {
-                            if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4);
-                        }
-                    });
-                } catch (e) {
-                    await responder('❌ Falha ao baixar o vídeo.');
-                }
-            } else {
-                await responder('⚠️ Envie ou responda a um *vídeo* com *' + p + 'ssom*!');
-            }
-            return;
-        }
+                 try {
+                     const mediaUpload = await prepareWAMessageMedia(
+                         { video: fs.readFileSync(outMp4) },
+                         { upload: sock.waUploadToServer }
+                     );
+
+                     const vidInfo = mediaUpload.videoMessage;
+
+                     const waMsg = generateWAMessageFromContent(from, {
+                         stickerMessage: {
+                             url: vidInfo.url,
+                             fileSha256: vidInfo.fileSha256,
+                             fileEncSha256: vidInfo.fileEncSha256,
+                             mediaKey: vidInfo.mediaKey,
+                             mimetype: 'video/mp4',
+                             height: 360,
+                             width: 360,
+                             directPath: vidInfo.directPath,
+                             fileLength: vidInfo.fileLength,
+                             mediaKeyTimestamp: vidInfo.mediaKeyTimestamp,
+                             isAnimated: true
+                         }
+                     }, { quoted: m });
+
+                     await sock.relayMessage(from, waMsg.message, { messageId: waMsg.key.id });
+                 } catch (eRelay) {
+                     console.log('Erro relay sticker com som:', eRelay);
+                     await responder('❌ Falha ao enviar sticker com som: ' + eRelay.message);
+                 } finally {
+                     if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4);
+                 }
+             });
+         } catch (e) {
+             delete downloadsPendentes['ssom_' + sender];
+             await responder('❌ Falha ao baixar o vídeo: ' + e.message);
+         }
+         return;
+     }
 
         // ==========================================
         // CRIAR FIGURINHA NORMAL (,s) E DOWNLOAD INTERATIVO (,baixar, ,mp3, ,mp4)
