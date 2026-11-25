@@ -4,7 +4,8 @@ console.info = function (...args) {
     if (typeof args[0] === 'string' && args[0].includes('Closing session')) return;
     origInfo.apply(console, args);
 };
-
+//versao2.0.1//
+const whaileys = require('whaileys');
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -14,12 +15,82 @@ const {
     generateWAMessageFromContent,
     prepareWAMessageMedia,
     Browsers
-} = require('whaileys');
+} = whaileys;
+// O proto pode aparecer com nomes diferentes dependendo da versão do whaileys.
+const proto = whaileys.proto || whaileys.WAProto || whaileys.default?.proto;
 const pino = require('pino');
 const qrcode = require('qrcode-terminal');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
 const fs = require('fs');
 const path = require('path');
+
+// Figurinhas sonoras: o WhatsApp recebe uma StickerMessage com AudioMessage
+// serializada no campo protobuf 26. Bibliotecas Baileys antigas ainda não
+// conhecem esse campo, então o encoder é complementado abaixo.
+const STICKER_AUDIO_FIELD = 26;
+const STICKER_AUDIO_TAG = (STICKER_AUDIO_FIELD << 3) | 2;
+const STICKER_AUDIO_PATCH_MARK = Symbol.for('hinata.stickerAudioEncoderPatched');
+const audiosPendentesSticker = new Map();
+const MIME_AUDIO_STICKER = 'audio/ogg; codecs=opus';
+
+function chaveAudioSticker(fileSha256) {
+    if (!fileSha256) return null;
+    try {
+        return Buffer.from(fileSha256).toString('base64');
+    } catch (_) {
+        return null;
+    }
+}
+
+function instalarPatchAudioSticker() {
+    const stickerProto = proto?.Message?.StickerMessage;
+    const audioProto = proto?.Message?.AudioMessage;
+    if (!stickerProto?.encode || !audioProto?.encode) {
+        throw new Error('A biblioteca whaileys não disponibilizou o protobuf necessário para figurinhas com áudio. Atualize a biblioteca.');
+    }
+
+    // Se a versão instalada já tiver o campo, não é necessário alterar o encoder.
+    if (stickerProto.fields?.audioMessage) return true;
+    if (stickerProto.encode[STICKER_AUDIO_PATCH_MARK]) return false;
+
+    const encodeOriginal = stickerProto.encode;
+    const encodeComAudio = function (mensagem, writer) {
+        const resultado = encodeOriginal.call(this, mensagem, writer);
+        const chave = chaveAudioSticker(mensagem?.fileSha256);
+        const audioBytes = chave ? audiosPendentesSticker.get(chave) : null;
+        if (audioBytes) {
+            resultado.uint32(STICKER_AUDIO_TAG).bytes(audioBytes);
+        }
+        return resultado;
+    };
+
+    Object.defineProperty(encodeComAudio, STICKER_AUDIO_PATCH_MARK, { value: true });
+    stickerProto.encode = encodeComAudio;
+    return false;
+}
+
+function calcularWaveform(pcm, quantidade = 64) {
+    const totalAmostras = Math.floor((pcm?.length || 0) / 2);
+    if (!totalAmostras) return Uint8Array.from(new Array(quantidade).fill(0));
+
+    const valores = [];
+    for (let barra = 0; barra < quantidade; barra++) {
+        const inicio = Math.floor((barra * totalAmostras) / quantidade);
+        const fim = Math.max(inicio + 1, Math.floor(((barra + 1) * totalAmostras) / quantidade));
+        let soma = 0;
+        let contagem = 0;
+        for (let i = inicio; i < Math.min(fim, totalAmostras); i++) {
+            soma += Math.abs(pcm.readInt16LE(i * 2));
+            contagem++;
+        }
+        valores.push(contagem ? soma / contagem : 0);
+    }
+
+    const pico = Math.max(...valores) || 1;
+    return Uint8Array.from(valores.map(valor => Math.max(0, Math.min(100, Math.round((valor / pico) * 100)))));
+}
 
 const HINATA_URL_PADRAO = 'https://cdn.myanimelist.net/images/characters/6/278736.jpg';
 
@@ -2551,25 +2622,17 @@ async function iniciarBot() {
             }
             return;
         }
-
 // ==========================================
-        // CRIAR FIGURINHA NATIVA COM SOM (,ssom) COM RASTREAMENTO DE LINHA
+        // FIGURINHA NATIVA COM SOM (,ssom)
+        // Converte o vídeo em WebP animado + áudio OGG/Opus e os vincula
+        // em uma única StickerMessage do WhatsApp.
         // ==========================================
         if (cmd === 'ssom' || cmd === 'stickersom' || cmd === 'figsom') {
             const relatarErro = async (etapa, err) => {
-                delete downloadsPendentes['ssom_' + sender];
-                const stackLines = (err?.stack || '').split('\n');
-                const linhaIndex = stackLines.find(l => l.includes('index.js')) || stackLines[1] || 'Linha desconhecida';
-                const matchLinha = linhaIndex.match(/index\.js:(\d+):(\d+)/);
-                const numLinha = matchLinha ? `Linha ${matchLinha[1]} (coluna ${matchLinha[2]})` : linhaIndex.trim();
-
-                const msgTerminal = `\n❌ [ERRO NO COMANDO ,ssom - ${etapa}]\n📍 Local: ${numLinha}\n💬 Motivo: ${err?.message || err}\n`;
-                console.error(msgTerminal);
-
+                console.error(`\n❌ [ERRO NO COMANDO ,ssom - ${etapa}]\n`, err?.stack || err);
                 await responder(
                     `❌ *ERRO NO COMANDO ,ssom*\n` +
                     `📌 *Etapa:* ${etapa}\n` +
-                    `📍 *Local:* ${numLinha}\n` +
                     `💬 *Detalhes:* ${err?.message || err}`
                 );
             };
@@ -2590,7 +2653,7 @@ async function iniciarBot() {
             const targetType = quoted ? Object.keys(quoted)[0] : tipoMsg;
 
             if (targetType !== 'videoMessage') {
-                return responder('⚠️ Envie um *vídeo* com *' + p + 'ssom* na legenda (ou responda a um vídeo)!');
+                return responder('⚠️ Envie um *vídeo com áudio* usando *' + p + 'ssom* na legenda ou responda a um vídeo com esse comando.');
             }
 
             if (downloadsPendentes['ssom_' + sender]) {
@@ -2598,11 +2661,19 @@ async function iniciarBot() {
             }
             downloadsPendentes['ssom_' + sender] = true;
 
-            await responder('⏳ Criando figurinha nativa com som...');
+            const temporarios = [];
+            let shaStickerPendente = null;
+            let audioFoiAnexadoPeloPatch = false;
+            let etapaAtual = 'ETAPA 1/6 (Preparação)';
 
             try {
-                console.log('[SSOM - ETAPA 1/5] Baixando vídeo do WhatsApp...');
-                const downloadComTimeout = Promise.race([
+                instalarPatchAudioSticker();
+                await responder('⏳ Criando figurinha animada com áudio...');
+
+                // 1. Baixar o vídeo original do WhatsApp.
+                etapaAtual = 'ETAPA 1/6 (Download do vídeo)';
+                console.log('[SSOM] Baixando vídeo do WhatsApp...');
+                const buf = await Promise.race([
                     downloadMediaMessage(
                         targetMsg,
                         'buffer',
@@ -2613,52 +2684,211 @@ async function iniciarBot() {
                         }
                     ),
                     new Promise((_, reject) =>
-                        setTimeout(() => reject(new Error('Tempo esgotado (15s) ao baixar vídeo do WhatsApp')), 15000)
+                        setTimeout(() => reject(new Error('Tempo esgotado ao baixar o vídeo (15 segundos).')), 15000)
                     )
                 ]);
 
-                const buf = await downloadComTimeout;
-                console.log(`[SSOM - ETAPA 2/5] Vídeo baixado (${buf.length} bytes). Salvando temporário...`);
+                if (!buf || !buf.length) throw new Error('O WhatsApp retornou um vídeo vazio.');
 
                 const ts = Date.now();
-                const inP = path.join(__dirname, 'in_som_' + ts + '.mp4');
-                const outMp4 = path.join(__dirname, 'out_som_' + ts + '.mp4');
+                const inP = path.join(__dirname, `in_som_${ts}.mp4`);
+                const outWebp = path.join(__dirname, `sticker_som_${ts}.webp`);
+                const outOgg = path.join(__dirname, `audio_som_${ts}.ogg`);
+                temporarios.push(inP, outWebp, outOgg);
                 fs.writeFileSync(inP, buf);
 
-                console.log('[SSOM - ETAPA 3/5] Convertendo vídeo e áudio no FFmpeg...');
-                const filtro = 'scale=320:320:force_original_aspect_ratio=decrease,pad=320:320:(ow-iw)/2:(oh-ih)/2:color=black';
-                const cmdSom = `ffmpeg -y -i "${inP}" -t 7 -vf "${filtro},fps=15" -c:v libx264 -preset ultrafast -crf 30 -pix_fmt yuv420p -c:a aac -b:a 64k -movflags +faststart "${outMp4}"`;
+                // 2. Descobrir a duração e confirmar que existe uma faixa de áudio.
+                etapaAtual = 'ETAPA 2/6 (Verificação do áudio)';
+                const probe = await execFileAsync('ffprobe', [
+                    '-v', 'error',
+                    '-show_entries', 'format=duration:stream=codec_type,duration',
+                    '-of', 'json',
+                    inP
+                ], { timeout: 15000, maxBuffer: 2 * 1024 * 1024 });
 
-                exec(cmdSom, { timeout: 25000 }, async (err, stdout, stderr) => {
-                    if (fs.existsSync(inP)) fs.unlinkSync(inP);
+                const dadosProbe = JSON.parse(probe.stdout || '{}');
+                const streams = dadosProbe.streams || [];
+                const faixaAudio = streams.find(stream => stream.codec_type === 'audio');
+                const faixaVideo = streams.find(stream => stream.codec_type === 'video');
+                if (!faixaVideo) throw new Error('O arquivo enviado não contém uma faixa de vídeo válida.');
+                if (!faixaAudio) throw new Error('Esse vídeo não possui áudio. Envie um vídeo que tenha som.');
 
-                    if (err || !fs.existsSync(outMp4)) {
-                        if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4);
-                        return relatarErro('ETAPA 3/5 (Conversão FFmpeg)', new Error(err?.message || stderr || 'Arquivo não gerado'));
+                const duracaoOriginal = Number(
+                    dadosProbe.format?.duration || faixaVideo.duration || faixaAudio.duration
+                );
+                if (!Number.isFinite(duracaoOriginal) || duracaoOriginal <= 0) {
+                    throw new Error('Não foi possível identificar a duração do vídeo.');
+                }
+
+                // O WhatsApp aceita clipes curtos para esse tipo de figurinha.
+                const duracao = Math.min(7, duracaoOriginal);
+                const duracaoTexto = duracao.toFixed(3);
+                const segundosAudio = Math.max(1, Math.ceil(duracao));
+
+                // 3. Extrair o som em OGG/Opus mono, formato esperado pelo WhatsApp.
+                etapaAtual = 'ETAPA 3/6 (Conversão do áudio para OGG/Opus)';
+                await execFileAsync('ffmpeg', [
+                    '-y', '-i', inP,
+                    '-map', '0:a:0', '-vn',
+                    '-af', `aresample=48000:first_pts=0,apad=whole_dur=${duracaoTexto}`,
+                    '-t', duracaoTexto,
+                    '-ac', '1',
+                    '-c:a', 'libopus',
+                    '-b:a', '32k',
+                    '-application', 'voip',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-map_metadata', '-1',
+                    outOgg
+                ], { timeout: 35000, maxBuffer: 4 * 1024 * 1024 });
+
+                if (!fs.existsSync(outOgg) || fs.statSync(outOgg).size < 100) {
+                    throw new Error('O FFmpeg não conseguiu gerar o áudio OGG/Opus. Verifique se seu FFmpeg possui suporte a libopus.');
+                }
+
+                // Gera a forma de onda usada pela interface de áudio do WhatsApp.
+                const pcmResult = await execFileAsync('ffmpeg', [
+                    '-v', 'error', '-i', outOgg,
+                    '-vn', '-f', 's16le', '-acodec', 'pcm_s16le',
+                    '-ac', '1', '-ar', '8000', 'pipe:1'
+                ], { timeout: 20000, maxBuffer: 4 * 1024 * 1024, encoding: 'buffer' });
+                const pcm = Buffer.isBuffer(pcmResult.stdout)
+                    ? pcmResult.stdout
+                    : Buffer.from(pcmResult.stdout || '');
+                const waveform = calcularWaveform(pcm);
+
+                // 4. Criar WebP animado. Reduz FPS/qualidade automaticamente até caber.
+                etapaAtual = 'ETAPA 4/6 (Conversão da animação para WebP)';
+                const filtroBase = 'scale=512:512:force_original_aspect_ratio=decrease:flags=lanczos,format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000';
+                const tentativasWebp = [
+                    { fps: 15, qualidade: 50 },
+                    { fps: 12, qualidade: 40 },
+                    { fps: 10, qualidade: 32 },
+                    { fps: 8, qualidade: 25 },
+                    { fps: 6, qualidade: 18 },
+                    { fps: 5, qualidade: 12 }
+                ];
+                let webpPronto = false;
+
+                for (const config of tentativasWebp) {
+                    if (fs.existsSync(outWebp)) fs.unlinkSync(outWebp);
+                    await execFileAsync('ffmpeg', [
+                        '-y', '-i', inP,
+                        '-t', duracaoTexto,
+                        '-vf', `fps=${config.fps},${filtroBase}`,
+                        '-an',
+                        '-vcodec', 'libwebp',
+                        '-lossless', '0',
+                        '-q:v', String(config.qualidade),
+                        '-compression_level', '6',
+                        '-loop', '0',
+                        '-preset', 'picture',
+                        outWebp
+                    ], { timeout: 40000, maxBuffer: 4 * 1024 * 1024 });
+
+                    if (fs.existsSync(outWebp) && fs.statSync(outWebp).size > 0 && fs.statSync(outWebp).size <= 500000) {
+                        webpPronto = true;
+                        break;
                     }
+                }
 
-                    console.log('[SSOM - ETAPA 4/5] Enviando sticker com som via whaileys...');
-                    try {
-                        await sock.sendMessage(from, {
-                            sticker: fs.readFileSync(outMp4),
-                            mimetype: 'video/mp4',
-                            isAnimated: true
-                        }, { quoted: m });
+                if (!webpPronto) {
+                    throw new Error('A animação ficou maior que 500 KB mesmo após a compressão. Tente um vídeo mais curto ou com menos movimento.');
+                }
 
-                        delete downloadsPendentes['ssom_' + sender];
-                        console.log('[SSOM - ETAPA 5/5] Concluído e entregue com sucesso!');
-                    } catch (eSend) {
-                        await relatarErro('ETAPA 4/5 (Envio sock.sendMessage)', eSend);
-                    } finally {
-                        if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4);
-                    }
+                // 5. Fazer upload das duas mídias e montar o objeto protobuf do áudio.
+                etapaAtual = 'ETAPA 5/6 (Upload das mídias)';
+                if (typeof sock.waUploadToServer !== 'function') {
+                    throw new Error('Esta versão do whaileys não oferece waUploadToServer; atualize a biblioteca para enviar mídias.');
+                }
+
+                const audioPreparado = await prepareWAMessageMedia({
+                    audio: fs.readFileSync(outOgg),
+                    mimetype: MIME_AUDIO_STICKER,
+                    seconds: segundosAudio,
+                    ptt: true,
+                    waveform
+                }, { upload: sock.waUploadToServer });
+
+                const stickerPreparado = await prepareWAMessageMedia({
+                    sticker: fs.readFileSync(outWebp),
+                    isAnimated: true
+                }, { upload: sock.waUploadToServer });
+
+                const audioBase = audioPreparado?.audioMessage;
+                const stickerMessage = stickerPreparado?.stickerMessage;
+                if (!audioBase?.url || !audioBase?.mediaKey || !stickerMessage?.fileSha256) {
+                    throw new Error('O WhatsApp não retornou os dados criptografados das mídias após o upload.');
+                }
+
+                const audioMessage = proto.Message.AudioMessage.create({
+                    url: audioBase.url,
+                    mimetype: MIME_AUDIO_STICKER,
+                    fileSha256: audioBase.fileSha256,
+                    fileLength: audioBase.fileLength,
+                    seconds: segundosAudio,
+                    ptt: true,
+                    mediaKey: audioBase.mediaKey,
+                    fileEncSha256: audioBase.fileEncSha256,
+                    directPath: audioBase.directPath,
+                    mediaKeyTimestamp: audioBase.mediaKeyTimestamp || Math.floor(Date.now() / 1000),
+                    waveform
                 });
-            } catch (eGeral) {
-                await relatarErro('ETAPA 1-2/5 (Download da Mídia)', eGeral);
+                const audioMessageBytes = proto.Message.AudioMessage.encode(audioMessage).finish();
+
+                stickerMessage.isAnimated = true;
+                stickerMessage.width = 512;
+                stickerMessage.height = 512;
+
+                // Versões antigas do protobuf não têm audioMessage no StickerMessage.
+                // Nesse caso, o encoder instalado acima injeta manualmente o campo 26.
+                if (proto.Message.StickerMessage.fields?.audioMessage) {
+                    stickerMessage.audioMessage = audioMessage;
+                } else {
+                    shaStickerPendente = stickerMessage.fileSha256;
+                    const chave = chaveAudioSticker(shaStickerPendente);
+                    if (!chave) throw new Error('Não foi possível identificar a figurinha enviada para anexar o áudio.');
+                    audiosPendentesSticker.set(chave, audioMessageBytes);
+                    audioFoiAnexadoPeloPatch = true;
+                }
+
+                // 6. Enviar como uma única StickerMessage (não como MP4 no campo sticker).
+                etapaAtual = 'ETAPA 6/6 (Envio da figurinha sonora)';
+                const mensagemPronta = generateWAMessageFromContent(
+                    from,
+                    { stickerMessage },
+                    { quoted: m, userJid: sock.user?.id }
+                );
+
+                try {
+                    await sock.relayMessage(from, mensagemPronta.message, {
+                        messageId: mensagemPronta.key.id
+                    });
+                } finally {
+                    if (audioFoiAnexadoPeloPatch && shaStickerPendente) {
+                        const chave = chaveAudioSticker(shaStickerPendente);
+                        if (chave) audiosPendentesSticker.delete(chave);
+                    }
+                }
+
+                console.log('[SSOM] Figurinha com som enviada com sucesso.');
+            } catch (err) {
+                await relatarErro(etapaAtual, err);
+            } finally {
+                delete downloadsPendentes['ssom_' + sender];
+                for (const arquivo of temporarios) {
+                    try {
+                        if (fs.existsSync(arquivo)) fs.unlinkSync(arquivo);
+                    } catch (erroLimpeza) {
+                        console.error('[SSOM] Não foi possível apagar temporário:', arquivo, erroLimpeza.message);
+                    }
+                }
+                if (audioFoiAnexadoPeloPatch && shaStickerPendente) {
+                    const chave = chaveAudioSticker(shaStickerPendente);
+                    if (chave) audiosPendentesSticker.delete(chave);
+                }
             }
             return;
         }
-
         // ==========================================
         // CRIAR FIGURINHA NORMAL (,s) E DOWNLOAD INTERATIVO (,baixar, ,mp3, ,mp4)
         // ==========================================
