@@ -2552,10 +2552,28 @@ async function iniciarBot() {
             return;
         }
 
-        // ==========================================
-        // CRIAR FIGURINHA NATIVA COM SOM (,ssom / ,stickersom) VIA WHAILEYS
+// ==========================================
+        // CRIAR FIGURINHA NATIVA COM SOM (,ssom) COM RASTREAMENTO DE LINHA
         // ==========================================
         if (cmd === 'ssom' || cmd === 'stickersom' || cmd === 'figsom') {
+            const relatarErro = async (etapa, err) => {
+                delete downloadsPendentes['ssom_' + sender];
+                const stackLines = (err?.stack || '').split('\n');
+                const linhaIndex = stackLines.find(l => l.includes('index.js')) || stackLines[1] || 'Linha desconhecida';
+                const matchLinha = linhaIndex.match(/index\.js:(\d+):(\d+)/);
+                const numLinha = matchLinha ? `Linha ${matchLinha[1]} (coluna ${matchLinha[2]})` : linhaIndex.trim();
+
+                const msgTerminal = `\n❌ [ERRO NO COMANDO ,ssom - ${etapa}]\n📍 Local: ${numLinha}\n💬 Motivo: ${err?.message || err}\n`;
+                console.error(msgTerminal);
+
+                await responder(
+                    `❌ *ERRO NO COMANDO ,ssom*\n` +
+                    `📌 *Etapa:* ${etapa}\n` +
+                    `📍 *Local:* ${numLinha}\n` +
+                    `💬 *Detalhes:* ${err?.message || err}`
+                );
+            };
+
             const ctx = m.message.extendedTextMessage?.contextInfo;
             const quoted = ctx?.quotedMessage;
             const targetMsg = quoted
@@ -2581,50 +2599,62 @@ async function iniciarBot() {
             downloadsPendentes['ssom_' + sender] = true;
 
             await responder('⏳ Criando figurinha nativa com som...');
+
             try {
-                const buf = await downloadMediaMessage(
-                    targetMsg,
-                    'buffer',
-                    {},
-                    {
-                        logger: pino({ level: 'silent' }),
-                        reuploadRequest: sock.updateMediaMessage
-                    }
-                );
+                console.log('[SSOM - ETAPA 1/5] Baixando vídeo do WhatsApp...');
+                const downloadComTimeout = Promise.race([
+                    downloadMediaMessage(
+                        targetMsg,
+                        'buffer',
+                        {},
+                        {
+                            logger: pino({ level: 'silent' }),
+                            reuploadRequest: sock.updateMediaMessage
+                        }
+                    ),
+                    new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Tempo esgotado (15s) ao baixar vídeo do WhatsApp')), 15000)
+                    )
+                ]);
+
+                const buf = await downloadComTimeout;
+                console.log(`[SSOM - ETAPA 2/5] Vídeo baixado (${buf.length} bytes). Salvando temporário...`);
 
                 const ts = Date.now();
                 const inP = path.join(__dirname, 'in_som_' + ts + '.mp4');
                 const outMp4 = path.join(__dirname, 'out_som_' + ts + '.mp4');
                 fs.writeFileSync(inP, buf);
 
+                console.log('[SSOM - ETAPA 3/5] Convertendo vídeo e áudio no FFmpeg...');
                 const filtro = 'scale=320:320:force_original_aspect_ratio=decrease,pad=320:320:(ow-iw)/2:(oh-ih)/2:color=black';
                 const cmdSom = `ffmpeg -y -i "${inP}" -t 7 -vf "${filtro},fps=15" -c:v libx264 -preset ultrafast -crf 30 -pix_fmt yuv420p -c:a aac -b:a 64k -movflags +faststart "${outMp4}"`;
 
-                exec(cmdSom, { timeout: 30000 }, async (err, stdout, stderr) => {
-                    delete downloadsPendentes['ssom_' + sender];
+                exec(cmdSom, { timeout: 25000 }, async (err, stdout, stderr) => {
                     if (fs.existsSync(inP)) fs.unlinkSync(inP);
 
                     if (err || !fs.existsSync(outMp4)) {
-                        console.log('[SSOM] Erro FFmpeg:', stderr || err?.message);
-                        return responder('❌ Erro no FFmpeg: ' + (err?.message || 'falha ao converter'));
+                        if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4);
+                        return relatarErro('ETAPA 3/5 (Conversão FFmpeg)', new Error(err?.message || stderr || 'Arquivo não gerado'));
                     }
 
+                    console.log('[SSOM - ETAPA 4/5] Enviando sticker com som via whaileys...');
                     try {
                         await sock.sendMessage(from, {
                             sticker: fs.readFileSync(outMp4),
+                            mimetype: 'video/mp4',
                             isAnimated: true
                         }, { quoted: m });
+
+                        delete downloadsPendentes['ssom_' + sender];
+                        console.log('[SSOM - ETAPA 5/5] Concluído e entregue com sucesso!');
                     } catch (eSend) {
-                        console.log('[SSOM] Erro envio whaileys:', eSend);
-                        await responder('❌ Falha ao enviar sticker com som: ' + eSend.message);
+                        await relatarErro('ETAPA 4/5 (Envio sock.sendMessage)', eSend);
                     } finally {
                         if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4);
                     }
                 });
-            } catch (e) {
-                delete downloadsPendentes['ssom_' + sender];
-                console.log('[SSOM] Erro download:', e);
-                await responder('❌ Falha ao baixar o vídeo: ' + e.message);
+            } catch (eGeral) {
+                await relatarErro('ETAPA 1-2/5 (Download da Mídia)', eGeral);
             }
             return;
         }
