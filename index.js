@@ -4,7 +4,7 @@ console.info = function (...args) {
     if (typeof args[0] === 'string' && args[0].includes('Closing session')) return;
     origInfo.apply(console, args);
 };
-//versao3.0.1//
+//versao2.0.1//
 const whaileys = require('whaileys');
 const {
     default: makeWASocket,
@@ -25,6 +25,67 @@ const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+
+// Impede que erros temporarios de rede ou rate-overlimit (429) derrubem o bot
+process.on('uncaughtException', (err) => {
+    console.error('⚠️ Erro capturado (bot mantido online):', err?.message || err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('⚠️ Rejeição assíncrona capturada:', reason?.message || reason);
+});
+
+const cooldownIaGrupo = {};
+
+// Gera audio de voz feminina em portugues (OGG/Opus) a partir de um texto
+async function gerarAudioVozHinata(textoFala) {
+    const limpo = textoFala
+        .replace(/[*_~`]/g, '')
+        .replace(/[\u{1F300}-\u{1FAFF}]/gu, '')
+        .trim()
+        .slice(0, 180);
+    if (!limpo) return null;
+
+    const ts = Date.now() + '_' + Math.floor(Math.random() * 1000);
+    const mp3Temp = path.join(__dirname, `voz_hinata_${ts}.mp3`);
+    const oggTemp = path.join(__dirname, `voz_hinata_${ts}.ogg`);
+    const urlTts = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(limpo)}&tl=pt-BR&client=tw-ob`;
+
+    try {
+        await new Promise((resolve, reject) => {
+            https.get(urlTts, {
+                headers: { 'User-Agent': 'Mozilla/5.0' },
+                timeout: 10000
+            }, (res) => {
+                if (res.statusCode !== 200) {
+                    res.resume();
+                    return reject(new Error('HTTP ' + res.statusCode));
+                }
+                const file = fs.createWriteStream(mp3Temp);
+                res.pipe(file);
+                file.on('finish', () => file.close(resolve));
+                file.on('error', reject);
+            }).on('error', reject);
+        });
+
+        // Ajusta levemente o timbre para soar mais suave/feminino e converte para OGG/Opus do WhatsApp
+        await execFileAsync('ffmpeg', [
+            '-y', '-i', mp3Temp,
+            '-af', 'asetrate=24000*1.08,aresample=48000,atempo=0.95',
+            '-ac', '1', '-c:a', 'libopus', '-b:a', '40k', '-application', 'voip',
+            oggTemp
+        ], { timeout: 15000 });
+
+        if (!fs.existsSync(oggTemp) || fs.statSync(oggTemp).size < 100) return null;
+        return fs.readFileSync(oggTemp);
+    } catch (e) {
+        console.log('[VOZ HINATA] Falha ao gerar áudio:', e.message);
+        return null;
+    } finally {
+        try { if (fs.existsSync(mp3Temp)) fs.unlinkSync(mp3Temp); } catch (_) {}
+        try { if (fs.existsSync(oggTemp)) fs.unlinkSync(oggTemp); } catch (_) {}
+    }
+}
 
 // Figurinhas sonoras: o WhatsApp recebe uma StickerMessage com AudioMessage
 // serializada no campo protobuf 26. Bibliotecas Baileys antigas ainda não
@@ -380,18 +441,20 @@ function checarVencedorVelha(b) {
 }
 
 async function iniciarBot() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+
     const { version } = await fetchLatestBaileysVersion();
 
-    const sock = makeWASocket({
-        version,
-        auth: state,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: false,
-        browser: Browsers.ubuntu('Chrome'),
-        syncFullHistory: false,
-        markOnlineOnConnect: false
-    });
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: false,
+    browser: Browsers.macOS('Desktop'),
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    getMessage: async () => ({ conversation: '' })
+});
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -515,7 +578,7 @@ async function iniciarBot() {
             if (formato === 'mp3') {
                 await responder('🎵 Baixando e convertendo para *MP3 (Musica)*, aguarde...');
                 const outA = path.join(__dirname, 'aud_' + Date.now() + '.mp3');
-                const dlCmd = `yt-dlp ${flagFfmpeg}--extractor-args "youtube:player_client=android" -x --audio-format mp3 --max-filesize 50M -o "${outA}" "${url}"`;
+                const dlCmd = `yt-dlp ${flagFfmpeg}--extractor-args "youtube:player_client=tv,web" -x --audio-format mp3 --max-filesize 50M -o "${outA}" "${url}"`;
 
                 exec(dlCmd, async (err, stdout, stderr) => {
                     if (err || !fs.existsSync(outA)) {
@@ -536,7 +599,7 @@ async function iniciarBot() {
             } else {
                 await responder('🎬 Baixando *Video (MP4)*, aguarde...');
                 const outV = path.join(__dirname, 'vid_' + Date.now() + '.mp4');
-                const dlCmd = `yt-dlp ${flagFfmpeg}--extractor-args "youtube:player_client=android" -f "best[ext=mp4][height<=720]/best[ext=mp4]/best" --max-filesize 50M -o "${outV}" "${url}"`;
+                const dlCmd = `yt-dlp ${flagFfmpeg}--extractor-args "youtube:player_client=tv,web" -f "best[ext=mp4][height<=720]/best[ext=mp4]/best" --max-filesize 50M -o "${outV}" "${url}"`;
 
                 exec(dlCmd, async (err, stdout, stderr) => {
                     if (err || !fs.existsSync(outV)) {
@@ -683,13 +746,15 @@ async function iniciarBot() {
                 }
 
                 // =========================================================
-                // 🧠 3. SISTEMA DE APRENDIZADO AUTOMATICO (ESTILO SIMSIMI)
+                // 🧠 3. IA MELHORADA + RESPOSTA EM ÁUDIO QUANDO CITAREM "HINATA"
                 // =========================================================
                 if (isGroup && groupCfg.iaAtiva) {
                     const txtLimpoIA = texto.trim();
+                    const ehRisadaOuRuido = /^(k+|ha+|rs+|hue+|ok|sim|não|nao|ata|hm+|ué|ue|\?+|\.+)$/i.test(txtLimpoIA);
                     const ehValidoParaAprender =
-                        txtLimpoIA.length >= 3 &&
+                        txtLimpoIA.length >= 4 &&
                         txtLimpoIA.length <= 120 &&
+                        !ehRisadaOuRuido &&
                         !txtLimpoIA.includes('http') &&
                         !txtLimpoIA.includes('@') &&
                         !/^\d+$/.test(txtLimpoIA);
@@ -701,47 +766,72 @@ async function iniciarBot() {
                     const respondeuAoBot = mesmoUsuario(autorRespondido, botId) || (botLid && mesmoUsuario(autorRespondido, botLid));
 
                     if (ehValidoParaAprender) {
-                        if (msgRespondida && !respondeuAoBot && msgRespondida.length >= 3 && msgRespondida.length <= 120 && !msgRespondida.startsWith(p)) {
+                        if (msgRespondida && !respondeuAoBot && msgRespondida.length >= 4 && msgRespondida.length <= 120 && !msgRespondida.startsWith(p)) {
                             const chavePergunta = msgRespondida.trim().toLowerCase();
                             if (!db.brain.pares[chavePergunta]) db.brain.pares[chavePergunta] = [];
-                            if (!db.brain.pares[chavePergunta].includes(txtLimpoIA)) {
+                            const jaExiste = db.brain.pares[chavePergunta].some(f => f.toLowerCase() === txtLimpoIA.toLowerCase());
+                            if (!jaExiste) {
                                 db.brain.pares[chavePergunta].push(txtLimpoIA);
-                                if (db.brain.pares[chavePergunta].length > 15) db.brain.pares[chavePergunta].shift();
+                                if (db.brain.pares[chavePergunta].length > 20) db.brain.pares[chavePergunta].shift();
                                 salvarDB(db);
                             }
-                        } else if (!db.brain.soltas.includes(txtLimpoIA)) {
+                        } else if (!db.brain.soltas.some(f => f.toLowerCase() === txtLimpoIA.toLowerCase())) {
                             db.brain.soltas.push(txtLimpoIA);
-                            if (db.brain.soltas.length > 300) db.brain.soltas.shift();
+                            if (db.brain.soltas.length > 400) db.brain.soltas.shift();
                             salvarDB(db);
                         }
                     }
 
-                    const chamouHinata = txtLow.includes('hinata');
-                    const sorteioChance = (Math.random() * 100) < (groupCfg.iaChance || 25);
+                    const chamouHinata = /\bhinata\b/i.test(txtLow);
+                    const agoraIa = Date.now();
+                    const ultimoEnvioIa = cooldownIaGrupo[from] || 0;
+                    const podeResponderAgora = chamouHinata || respondeuAoBot || ((agoraIa - ultimoEnvioIa) > 12000);
+                    const sorteioChance = (Math.random() * 100) < (groupCfg.iaChance || 20);
 
-                    if (respondeuAoBot || chamouHinata || sorteioChance) {
+                    if (podeResponderAgora && (respondeuAoBot || chamouHinata || sorteioChance)) {
+                        const consultaLimpa = txtLow.replace(/\bhinata\b/gi, '').replace(/[,!?]+/g, ' ').trim();
                         let possiveisRespostas = [];
 
-                        if (db.brain.pares[txtLow]) {
+                        if (consultaLimpa && db.brain.pares[consultaLimpa]) {
+                            possiveisRespostas = db.brain.pares[consultaLimpa];
+                        } else if (db.brain.pares[txtLow]) {
                             possiveisRespostas = db.brain.pares[txtLow];
-                        } else {
+                        } else if (consultaLimpa.length >= 4) {
+                            const palavrasChave = consultaLimpa.split(/\s+/).filter(w => w.length >= 4);
                             const chavesAprendidas = Object.keys(db.brain.pares);
                             const parecida = chavesAprendidas.find(k =>
-                                (txtLow.length >= 4 && k.includes(txtLow)) ||
-                                (k.length >= 4 && txtLow.includes(k))
+                                k.includes(consultaLimpa) ||
+                                consultaLimpa.includes(k) ||
+                                palavrasChave.some(pw => k.includes(pw))
                             );
                             if (parecida) possiveisRespostas = db.brain.pares[parecida];
                         }
 
-                        if (possiveisRespostas.length === 0 && (respondeuAoBot || chamouHinata || Math.random() < 0.30)) {
+                        if (possiveisRespostas.length === 0 && (respondeuAoBot || chamouHinata || Math.random() < 0.35)) {
                             possiveisRespostas = db.brain.soltas.filter(f => f.toLowerCase() !== txtLow);
                         }
 
-                        if (possiveisRespostas.length > 0) {
-                            const escolhida = possiveisRespostas[Math.floor(Math.random() * possiveisRespostas.length)];
-                            return await sock.sendMessage(from, { text: escolhida }, { quoted: m });
-                        } else if (chamouHinata) {
-                            return await sock.sendMessage(from, { text: '🌸 Oi! Continue conversando no grupo para eu aprender novas falas com vocês!' }, { quoted: m });
+                        const fraseFinal = possiveisRespostas.length > 0
+                            ? possiveisRespostas[Math.floor(Math.random() * possiveisRespostas.length)]
+                            : (chamouHinata ? 'Oi! Me chamou? Continue conversando no grupo para eu aprender mais!' : '');
+
+                        if (fraseFinal) {
+                            cooldownIaGrupo[from] = agoraIa;
+                            try {
+                                if (chamouHinata) {
+                                    const audioVoz = await gerarAudioVozHinata(fraseFinal);
+                                    if (audioVoz) {
+                                        return await sock.sendMessage(from, {
+                                            audio: audioVoz,
+                                            mimetype: 'audio/ogg; codecs=opus',
+                                            ptt: true
+                                        }, { quoted: m });
+                                    }
+                                }
+                                return await sock.sendMessage(from, { text: fraseFinal }, { quoted: m });
+                            } catch (errIa) {
+                                console.log('⚠️ Limite temporário ao enviar resposta da IA:', errIa.message);
+                            }
                         }
                     }
                 }
@@ -764,7 +854,8 @@ async function iniciarBot() {
             const txt = [
                 '🌸 *HINATA BOT - MENU* 🌸 (Prefixo: *' + p + '*)',
                 '',
-                '🧠 *INTELIGENCIA E APRENDIZADO:*',
+                '🧠 *INTELIGENCIA, VOZ E APRENDIZADO:*',
+                '├ *' + p + 'falar <texto>* - Faz a Hinata falar por áudio 🎙️',
                 '├ *' + p + 'ia on/off* - Liga/desliga aprendizado de falas',
                 '├ *' + p + 'ia chance <1-100>* - Chance de falar sozinha',
                 '├ *' + p + 'cerebro* - Mostra quantas falas ja aprendeu',
@@ -959,6 +1050,22 @@ async function iniciarBot() {
             txt.push('');
             txt.push(`🗑️ Para apagar uma, digite: *${p}delresp <palavra>*`);
             return responder(txt.join('\n'));
+        }
+
+        if (cmd === 'falar' || cmd === 'tts' || cmd === 'vozhinata') {
+            const fraseFalar = texto.trim().slice(p.length + cmd.length).trim();
+            if (!fraseFalar) {
+                return responder(`🎙️ Digite o texto para a Hinata falar!\nExemplo: *${p}falar Olá pessoal do grupo!*`);
+            }
+            const audioVoz = await gerarAudioVozHinata(fraseFalar);
+            if (!audioVoz) {
+                return responder('❌ Não consegui gerar o áudio agora. Tente novamente em instantes.');
+            }
+            return await sock.sendMessage(from, {
+                audio: audioVoz,
+                mimetype: 'audio/ogg; codecs=opus',
+                ptt: true
+            }, { quoted: m });
         }
 
         if (cmd === 'ia' || cmd === 'modofalante') {
