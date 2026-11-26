@@ -4,7 +4,7 @@ console.info = function (...args) {
     if (typeof args[0] === 'string' && args[0].includes('Closing session')) return;
     origInfo.apply(console, args);
 };
-//versao2.0.1//
+//versao3.0.1//
 const whaileys = require('whaileys');
 const {
     default: makeWASocket,
@@ -2606,11 +2606,70 @@ async function iniciarBot() {
                 .filter(jid => typeof jid === 'string' && jid.includes('@'))
                 .filter(jid => !mesmoUsuario(jid, botId) && !(botLid && mesmoUsuario(jid, botLid))))];
             if (!membros.length) return responder('⚠️ Não encontrei participantes para marcar.');
-            const legenda = args.join(' ').trim() || 'Atenção, pessoal!';
-            // Uma única mensagem: o texto fica limpo, enquanto a lista de
-            // participantes vai no campo mentions para notificar o grupo.
+            const legenda = args.join(' ').trim();
+            const contexto = m.message.extendedTextMessage?.contextInfo ||
+                m.message.imageMessage?.contextInfo ||
+                m.message.videoMessage?.contextInfo || {};
+            const mensagemRespondida = contexto.quotedMessage;
+
+            // Quando o comando é uma resposta, republica o conteúdo respondido.
+            // Texto/foto/vídeo/documento recebem as menções na própria mensagem.
+            if (mensagemRespondida) {
+                const tipoRespondido = Object.keys(mensagemRespondida)[0];
+                const chaveRespondida = {
+                    remoteJid: from,
+                    id: contexto.stanzaId,
+                    participant: contexto.participant || sender,
+                    fromMe: false
+                };
+                const msgRespondida = { key: chaveRespondida, message: mensagemRespondida };
+                const textoOriginal = mensagemRespondida.conversation ||
+                    mensagemRespondida.extendedTextMessage?.text ||
+                    mensagemRespondida.imageMessage?.caption ||
+                    mensagemRespondida.videoMessage?.caption ||
+                    mensagemRespondida.documentMessage?.caption || '';
+                const textoFinal = legenda || textoOriginal;
+
+                if (tipoRespondido === 'conversation' || tipoRespondido === 'extendedTextMessage') {
+                    const textoRepostado = textoFinal || ' '; 
+                    await sock.sendMessage(from, { text: textoRepostado, mentions: membros });
+                } else if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(tipoRespondido)) {
+                    try {
+                        const buffer = await downloadMediaMessage(msgRespondida, 'buffer', {});
+                        if (tipoRespondido === 'imageMessage') {
+                            await sock.sendMessage(from, { image: buffer, caption: textoFinal || 'Atenção, pessoal!', mentions: membros });
+                        } else if (tipoRespondido === 'videoMessage') {
+                            await sock.sendMessage(from, { video: buffer, caption: textoFinal || 'Atenção, pessoal!', mentions: membros });
+                        } else if (tipoRespondido === 'audioMessage') {
+                            await sock.sendMessage(from, { audio: buffer, mimetype: mensagemRespondida.audioMessage.mimetype || 'audio/ogg; codecs=opus', ptt: !!mensagemRespondida.audioMessage.ptt });
+                            await sock.sendMessage(from, { text: legenda || textoOriginal || 'Atenção, pessoal!', mentions: membros });
+                        } else if (tipoRespondido === 'documentMessage') {
+                            await sock.sendMessage(from, { document: buffer, mimetype: mensagemRespondida.documentMessage.mimetype || 'application/octet-stream', fileName: mensagemRespondida.documentMessage.fileName || 'arquivo', caption: textoFinal || 'Atenção, pessoal!', mentions: membros });
+                        } else {
+                            await sock.sendMessage(from, { sticker: buffer });
+                            await sock.sendMessage(from, { text: legenda || textoOriginal || 'Atenção, pessoal!', mentions: membros });
+                        }
+                    } catch (erroMidia) {
+                        console.log('Erro ao republicar mídia no totag:', erroMidia.message);
+                        return responder('❌ Não consegui republicar essa mídia. Tente responder a uma foto, vídeo ou mensagem de texto.');
+                    }
+                } else {
+                    // Fallback para tipos menos comuns: tenta retransmitir o conteúdo original.
+                    try {
+                        const encaminhada = await generateWAMessageFromContent(from, mensagemRespondida, { userJid: botId });
+                        await sock.relayMessage(from, encaminhada.message, { messageId: encaminhada.key.id });
+                        await sock.sendMessage(from, { text: legenda || textoOriginal || 'Atenção, pessoal!', mentions: membros });
+                    } catch (erroForward) {
+                        console.log('Erro ao republicar mensagem no totag:', erroForward.message);
+                        return responder('❌ Não consegui republicar esse tipo de mensagem.');
+                    }
+                }
+                return;
+            }
+
+            // Sem responder a uma mensagem, mantém o modo de legenda digitada.
             await sock.sendMessage(from, {
-                text: legenda,
+                text: legenda || 'Atenção, pessoal!',
                 mentions: membros
             }, { quoted: m });
             return;
