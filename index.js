@@ -36,6 +36,7 @@ process.on('unhandledRejection', (reason) => {
 });
 
 const cooldownIaGrupo = {};
+const cacheMensagens = new Map();
 
 // Gera audio de voz feminina em portugues (OGG/Opus) a partir de um texto
 async function gerarAudioVozHinata(textoFala) {
@@ -221,6 +222,7 @@ function carregarDB() {
         if (!d.brain.pares) d.brain.pares = {};
         if (!d.brain.soltas) d.brain.soltas = [];
         if (!d.prefix) d.prefix = ',';
+        if (d.antiPv === undefined) d.antiPv = false;
         return d;
     } catch (e) {
         return { prefix: ',', owners: [], users: {}, groups: {}, brain: { pares: {}, soltas: [] } };
@@ -441,20 +443,21 @@ function checarVencedorVelha(b) {
 }
 
 async function iniciarBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     const { version } = await fetchLatestBaileysVersion();
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false,
-    browser: Browsers.macOS('Desktop'),
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    getMessage: async () => ({ conversation: '' })
-});
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: false,
+        browser: Browsers.macOS('Desktop'),
+        syncFullHistory: false,
+        markOnlineOnConnect: false,
+        getMessage: async (key) => {
+            return cacheMensagens.get(key.id) || { conversation: '' };
+        }
+    });
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -564,8 +567,29 @@ async function iniciarBot() {
         const isOwner = m.key.fromMe || mesmoUsuario(sender, botId) || (botLid && mesmoUsuario(sender, botLid)) || db.owners.some(o => mesmoUsuario(sender, o));
         const groupCfg = obterGrupo(db, from);
 
-        const responder = (txt, mentions = []) => {
-            return sock.sendMessage(from, { text: txt, mentions }, { quoted: m });
+        // ==========================================
+        // 🛡️ ANTI-PV (BLOQUEIA QUEM CHAMAR NO PRIVADO)
+        // ==========================================
+        if (!isGroup && from !== 'status@broadcast' && !isOwner && !m.key.fromMe && db.antiPv) {
+            try {
+                console.log(`[ANTI-PV] Bloqueando ${senderNum} por chamar no privado.`);
+                await sock.updateBlockStatus(from, 'block');
+            } catch (errBlock) {
+                console.log('[ANTI-PV] Erro ao bloquear:', errBlock.message);
+            }
+            return;
+        }
+
+        const responder = async (txt, mentions = []) => {
+            const enviada = await sock.sendMessage(from, { text: txt, mentions }, { quoted: m });
+            if (enviada?.key?.id && enviada?.message) {
+                cacheMensagens.set(enviada.key.id, enviada.message);
+                if (cacheMensagens.size > 500) {
+                    const primeiraChave = cacheMensagens.keys().next().value;
+                    cacheMensagens.delete(primeiraChave);
+                }
+            }
+            return enviada;
         };
 
         // ==========================================
@@ -902,7 +926,7 @@ async function iniciarBot() {
                 '├ *' + p + 'bv on/off* | *' + p + 'setbv <texto>* | *' + p + 'testbv*',
                 '├ *' + p + 'addresp <gatilho> | <resposta>* - Cria fala fixa',
                 '├ *' + p + 'delresp <gatilho>* | *' + p + 'listaresp*',
-                '├ *' + p + 'antilink on/off* | *' + p + 'autoresp on/off* | *' + p + 'ban <@>*',
+                '├ *' + p + 'antilink on/off* | *' + p + 'antipv on/off* | *' + p + 'autoresp on/off* | *' + p + 'ban <@>*',
                 '└ *' + p + 'donos* | *' + p + 'adddono* | *' + p + 'deldono* | *' + p + 'resetgold*'
             ].join('\n');
 
@@ -2185,6 +2209,23 @@ async function iniciarBot() {
             db.owners = db.owners.filter(n => n !== alvo);
             salvarDB(db);
             return responder('🗑️ O dono @' + alvo + ' (`' + alvo + '`) foi removido com sucesso!', [alvo + '@s.whatsapp.net']);
+        }
+
+        if (cmd === 'antipv') {
+            if (!isOwner) return responder('🔒 Apenas os Donos podem ativar ou desativar o Anti-PV.');
+            const op = (args[0] || '').toLowerCase();
+            if (op === 'on' || op === '1' || op === 'ligar') {
+                db.antiPv = true;
+                salvarDB(db);
+                return responder('🛡️ *Anti-PV ATIVADO!* Qualquer pessoa (exceto os Donos) que mandar mensagem no privado da Hinata será bloqueada automaticamente.');
+            } else if (op === 'off' || op === '0' || op === 'desligar') {
+                db.antiPv = false;
+                salvarDB(db);
+                return responder('🔓 *Anti-PV DESATIVADO!* O privado da Hinata está liberado novamente.');
+            } else {
+                const status = db.antiPv ? 'ATIVADO ✅' : 'DESATIVADO ❌';
+                return responder(`🛡️ Status do Anti-PV: *${status}*\nUse *${p}antipv on* ou *${p}antipv off*.`);
+            }
         }
 
         if (cmd === 'prefixo' || cmd === 'prefix') {
