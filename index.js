@@ -793,9 +793,17 @@ async function iniciarBot() {
                 '├ *' + p + 'pettrocar* | *' + p + 'petcasal* | *' + p + 'petaceitar*',
                 '└ *' + p + 'petranking* | *' + p + 'petcolecao* | *' + p + 'petevento*',
                 '',
-                '📥 *DOWNLOADS E FIGURINHAS:*',
+                '📥 *DOWNLOADS, FIGURINHAS E ÁUDIO:*',
+                '├ *' + p + 'play <nome>* - Busca música pelo nome 🎵',
+                '├ *' + p + 'play video <nome>* - Busca vídeo pelo nome 🎬',
                 '├ *' + p + 'baixar <link>* - Escolher 1 (Video) ou 2 (Musica)',
                 '├ *' + p + 's* | *' + p + 'ssom* (Figurinha c/ áudio 🔊)',
+                '├ *' + p + 'toimg* - Converte figurinha em imagem/vídeo 🖼️',
+                '├ *' + p + 'att <texto>* - Figurinha de texto colorido 🌈',
+                '├ *' + p + 'attp <texto>* - Figurinha de texto animada ✨',
+                '├ *' + p + 'efeito <grave/agudo/eco/robot/lento/rapido>* - Efeito no áudio 🎛️',
+                '├ *' + p + 'totag <legenda>* - Marca todos do grupo 📢',
+                '├ *' + p + 'reverso* | *' + p + 'acelerar [1.5]* - Efeitos de áudio 🎛️',
                 '├ *' + p + 'addfig* | *' + p + 'fig <1-10>* (' + totalFigs + ' salvas)',
                 '└ *' + p + 'velha [@user]* / *' + p + 'jogar <1-9>* - Jogo da Velha',
                 '',
@@ -2586,6 +2594,140 @@ async function iniciarBot() {
         }
 
         // ==========================================
+        // MARCAR TODOS OS MEMBROS DO GRUPO (,totag)
+        // ==========================================
+        if (cmd === 'totag' || cmd === 'marcartodos') {
+            if (!isGroup) return responder('⚠️ Esse comando só funciona em grupos.');
+            const { isSenderAdmin, isBotAdmin } = await verificarAdms();
+            if (!isSenderAdmin) return responder('🔒 Apenas administradores podem usar o totag.');
+            const meta = await sock.groupMetadata(from);
+            const membros = [...new Set((meta.participants || [])
+                .map(x => x.id || x.jid || x.phoneNumber || x.lid)
+                .filter(jid => typeof jid === 'string' && jid.includes('@'))
+                .filter(jid => !mesmoUsuario(jid, botId) && !(botLid && mesmoUsuario(jid, botLid))))];
+            if (!membros.length) return responder('⚠️ Não encontrei participantes para marcar.');
+            const legenda = args.join(' ').trim() || 'Atenção, pessoal!';
+            // Uma única mensagem: o texto fica limpo, enquanto a lista de
+            // participantes vai no campo mentions para notificar o grupo.
+            await sock.sendMessage(from, {
+                text: legenda,
+                mentions: membros
+            }, { quoted: m });
+            return;
+        }
+
+        // ==========================================
+        // FIGURINHAS DE TEXTO (,att e ,attp)
+        // Renderiza com FFmpeg em 512x512, sem bibliotecas extras.
+        // ==========================================
+        if (cmd === 'att' || cmd === 'attp') {
+            const frase = args.join(' ').trim();
+            if (!frase) return responder(`✍️ Digite o texto da figurinha.\nExemplo: *${p}${cmd} Hinata Bot*`);
+            if (frase.length > 80) return responder('⚠️ Use no máximo 80 caracteres para a figurinha ficar legível.');
+            const animada = cmd === 'attp';
+            const ts = Date.now();
+            const base = path.join(__dirname, `att_${ts}`);
+            const txtPath = base + '.txt';
+            const outPath = base + '.webp';
+            const temporarios = [txtPath, outPath];
+            try {
+                fs.writeFileSync(txtPath, frase.replace(/\r/g, '').replace(/\n/g, '\n'), 'utf8');
+                const escapeFilterPath = v => v.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+                const textoFile = escapeFilterPath(txtPath);
+                const fontCandidates = [
+                    '/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
+                    '/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans.ttf',
+                    '/data/data/com.termux/files/usr/share/fonts/DejaVuSans-Bold.ttf',
+                    '/system/fonts/Roboto-Bold.ttf',
+                    '/system/fonts/Roboto-Regular.ttf',
+                    '/system/fonts/NotoSans-Regular.ttf',
+                    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+                    '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
+                    path.join(process.env.WINDIR || 'C:\\Windows', 'Fonts', 'arialbd.ttf'),
+                    path.join(process.env.WINDIR || 'C:\\Windows', 'Fonts', 'arial.ttf'),
+                    '/Library/Fonts/Arial Bold.ttf',
+                    '/System/Library/Fonts/Supplemental/Arial.ttf'
+                ];
+                const fontPath = fontCandidates.find(f => fs.existsSync(f));
+                if (!fontPath) throw new Error('Não encontrei uma fonte no computador. No Windows, confira C:\\Windows\\Fonts; no Linux, instale fonts-dejavu; no Termux, use pkg install fontconfig ttf-dejavu.');
+                const fontPart = `fontfile='${escapeFilterPath(fontPath)}':`;
+                // Aponta o Fontconfig para a configuração padrão quando ela existe.
+                const fcCandidates = [
+                    '/etc/fonts/fonts.conf',
+                    '/usr/etc/fonts/fonts.conf',
+                    path.join(process.env.PREFIX || '', 'etc', 'fonts', 'fonts.conf')
+                ].filter(Boolean);
+                const fcConfig = fcCandidates.find(f => fs.existsSync(f));
+                const ffmpegEnv = { ...process.env };
+                if (fcConfig) {
+                    ffmpegEnv.FONTCONFIG_FILE = fcConfig;
+                    ffmpegEnv.FONTCONFIG_PATH = path.dirname(fcConfig);
+                }
+                const cores = ['0xFF4D8D', '0x35C9FF', '0xB56BFF', '0xFFD447', '0x4DE39A', '0xFF744D'];
+                if (!animada) {
+                    const filtro = `drawtext=${fontPart}textfile='${textoFile}':expansion=none:fontcolor=${cores[0]}:fontsize=48:line_spacing=12:borderw=4:bordercolor=black:shadowcolor=black:shadowx=3:shadowy=3:x=(w-text_w)/2:y=(h-text_h)/2`;
+                    await execFileAsync('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'color=c=0x24133D:s=512x512:d=1', '-vf', filtro, '-frames:v', '1', '-c:v', 'libwebp', '-quality', '78', outPath], { timeout: 25000, maxBuffer: 2 * 1024 * 1024, env: ffmpegEnv });
+                } else {
+                    const pad = n => String(n).padStart(2, '0');
+                    for (let i = 0; i < cores.length; i++) {
+                        const frame = `${base}_${pad(i)}.png`;
+                        temporarios.push(frame);
+                        const filtro = `drawtext=${fontPart}textfile='${textoFile}':expansion=none:fontcolor=${cores[i]}:fontsize=48:line_spacing=12:borderw=4:bordercolor=black:shadowcolor=black:shadowx=3:shadowy=3:x=(w-text_w)/2:y=(h-text_h)/2`;
+                        await execFileAsync('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'color=c=0x24133D:s=512x512:d=1', '-vf', filtro, '-frames:v', '1', frame], { timeout: 15000, maxBuffer: 2 * 1024 * 1024, env: ffmpegEnv });
+                    }
+                    await execFileAsync('ffmpeg', ['-y', '-framerate', '3', '-i', `${base}_%02d.png`, '-loop', '0', '-an', '-c:v', 'libwebp_anim', '-lossless', '0', '-quality', '55', outPath], { timeout: 30000, maxBuffer: 2 * 1024 * 1024, env: ffmpegEnv });
+                }
+                if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 100) throw new Error('O FFmpeg não gerou a figurinha.');
+                await sock.sendMessage(from, { sticker: fs.readFileSync(outPath) }, { quoted: m });
+            } catch (e) {
+                console.error('[ATT] Erro:', e.message);
+                await responder('❌ Não consegui criar a figurinha. Erro: ' + (e.message || 'falha no FFmpeg').slice(0, 350) + '\n\nNo Termux, confira: pkg install ffmpeg fontconfig ttf-dejavu');
+            } finally {
+                for (const arq of temporarios) {
+                    try { if (fs.existsSync(arq)) fs.unlinkSync(arq); } catch (_) {}
+                }
+            }
+            return;
+        }
+
+        // ==========================================
+        // EFEITOS DE ÁUDIO (,efeito)
+        // ==========================================
+        if (cmd === 'efeito' || cmd === 'voz') {
+            const efeito = (args[0] || '').toLowerCase();
+            const filtros = {
+                grave: 'asetrate=48000*0.78,aresample=48000',
+                agudo: 'asetrate=48000*1.25,aresample=48000',
+                eco: 'aecho=0.8:0.7:80|160:0.35|0.2',
+                robot: 'acrusher=bits=8:mode=log:aa=1,highpass=f=300,lowpass=f=3000',
+                lento: 'atempo=0.75',
+                rapido: 'atempo=1.35'
+            };
+            if (!filtros[efeito]) return responder(`🎛️ *Efeitos disponíveis:*\n• ${p}efeito grave\n• ${p}efeito agudo\n• ${p}efeito eco\n• ${p}efeito lento\n• ${p}efeito rapido\n• ${p}efeito robot\n\nResponda a um áudio ou vídeo com o comando.`);
+            const ctx = m.message.extendedTextMessage?.contextInfo;
+            const quoted = ctx?.quotedMessage;
+            const targetMsg = quoted ? { key: { remoteJid: from, fromMe: false, id: ctx.stanzaId, participant: ctx.participant }, message: quoted } : m;
+            const targetType = quoted ? Object.keys(quoted)[0] : tipoMsg;
+            if (targetType !== 'audioMessage' && targetType !== 'videoMessage') return responder(`⚠️ Responda a um áudio ou vídeo com *${p}efeito ${efeito}*.`);
+            const inFile = path.join(__dirname, `efeito_in_${Date.now()}.bin`);
+            const outFile = path.join(__dirname, `efeito_out_${Date.now()}.ogg`);
+            try {
+                await responder(`🎛️ Aplicando efeito *${efeito}*...`);
+                const buf = await downloadMediaMessage(targetMsg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
+                fs.writeFileSync(inFile, buf);
+                await execFileAsync('ffmpeg', ['-y', '-i', inFile, '-vn', '-af', filtros[efeito], '-ac', '1', '-c:a', 'libopus', '-b:a', '40k', '-application', 'voip', outFile], { timeout: 45000, maxBuffer: 3 * 1024 * 1024 });
+                if (!fs.existsSync(outFile) || fs.statSync(outFile).size < 100) throw new Error('Arquivo de áudio vazio.');
+                await sock.sendMessage(from, { audio: fs.readFileSync(outFile), mimetype: 'audio/ogg; codecs=opus', ptt: true }, { quoted: m });
+            } catch (e) {
+                console.error('[EFEITO] Erro:', e.message);
+                await responder('❌ Não consegui aplicar o efeito. Verifique se a mídia tem áudio e se o FFmpeg está instalado.');
+            } finally {
+                for (const arq of [inFile, outFile]) { try { if (fs.existsSync(arq)) fs.unlinkSync(arq); } catch (_) {} }
+            }
+            return;
+        }
+
+        // ==========================================
         // PACK DE FIGURINHAS (,addfig e ,fig)
         // ==========================================
         if (cmd === 'addfig') {
@@ -2889,6 +3031,234 @@ async function iniciarBot() {
             }
             return;
         }
+
+        // ==========================================
+        // CONVERTER FIGURINHA EM IMAGEM/VÍDEO (,toimg)
+        // ==========================================
+        if (cmd === 'toimg' || cmd === 'topng' || cmd === 'tovideo') {
+            const ctx = m.message.extendedTextMessage?.contextInfo;
+            const quoted = ctx?.quotedMessage;
+            const stickerMsg = quoted?.stickerMessage;
+
+            if (!stickerMsg) {
+                return responder('⚠️ Responda a uma *figurinha* com *' + p + 'toimg* para converter!');
+            }
+
+            await responder('⏳ Convertendo figurinha...');
+            const ts = Date.now();
+            const inWebp = path.join(__dirname, `in_toimg_${ts}.webp`);
+            const outPng = path.join(__dirname, `out_toimg_${ts}.png`);
+            const outMp4 = path.join(__dirname, `out_toimg_${ts}.mp4`);
+
+            try {
+                const targetMsg = {
+                    key: {
+                        remoteJid: from,
+                        fromMe: false,
+                        id: ctx.stanzaId,
+                        participant: ctx.participant
+                    },
+                    message: quoted
+                };
+                const buf = await downloadMediaMessage(
+                    targetMsg,
+                    'buffer',
+                    {},
+                    {
+                        logger: pino({ level: 'silent' }),
+                        reuploadRequest: sock.updateMediaMessage
+                    }
+                );
+                fs.writeFileSync(inWebp, buf);
+
+                if (stickerMsg.isAnimated) {
+                    // Tenta converter figurinha animada para MP4 usando FFmpeg/Python fallback
+                    exec(`ffmpeg -y -i "${inWebp}" -movflags faststart -pix_fmt yuv420p -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" "${outMp4}"`, async (err) => {
+                        if (!err && fs.existsSync(outMp4) && fs.statSync(outMp4).size > 0) {
+                            await sock.sendMessage(from, {
+                                video: fs.readFileSync(outMp4),
+                                caption: '✅ Figurinha animada convertida!'
+                            }, { quoted: m });
+                            if (fs.existsSync(inWebp)) fs.unlinkSync(inWebp);
+                            if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4);
+                        } else {
+                            // Extrai primeiro frame como PNG caso o FFmpeg não decodifique WebP animado
+                            exec(`ffmpeg -y -i "${inWebp}" -vframes 1 "${outPng}"`, async (errPng) => {
+                                if (fs.existsSync(inWebp)) fs.unlinkSync(inWebp);
+                                if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4);
+                                if (errPng || !fs.existsSync(outPng)) {
+                                    return responder('❌ Não foi possível converter essa figurinha animada.');
+                                }
+                                await sock.sendMessage(from, {
+                                    image: fs.readFileSync(outPng),
+                                    caption: '✅ Quadro da figurinha extraído!'
+                                }, { quoted: m });
+                                if (fs.existsSync(outPng)) fs.unlinkSync(outPng);
+                            });
+                        }
+                    });
+                } else {
+                    exec(`ffmpeg -y -i "${inWebp}" "${outPng}"`, async (err) => {
+                        if (fs.existsSync(inWebp)) fs.unlinkSync(inWebp);
+                        if (err || !fs.existsSync(outPng)) {
+                            return responder('❌ Erro ao converter a figurinha em imagem.');
+                        }
+                        await sock.sendMessage(from, {
+                            image: fs.readFileSync(outPng),
+                            caption: '✅ Figurinha convertida em imagem!'
+                        }, { quoted: m });
+                        if (fs.existsSync(outPng)) fs.unlinkSync(outPng);
+                    });
+                }
+            } catch (e) {
+                if (fs.existsSync(inWebp)) fs.unlinkSync(inWebp);
+                if (fs.existsSync(outPng)) fs.unlinkSync(outPng);
+                if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4);
+                await responder('❌ Falha ao baixar ou converter a figurinha: ' + e.message);
+            }
+            return;
+        }
+
+       
+        // ==========================================
+        // BUSCAR MÚSICA OU VÍDEO PELO NOME (,play)
+        // Uso: ,play nome da música | ,play video nome do vídeo
+        // ==========================================
+        if (cmd === 'play' || cmd === 'tocar' || cmd === 'playvideo' || cmd === 'ytmp4') {
+            let modoVideo = ['playvideo', 'ytmp4'].includes(cmd);
+            let busca = texto.trim().slice(p.length + cmd.length).trim();
+            if (/^(video|vídeo|mp4)\s+/i.test(busca)) {
+                modoVideo = true;
+                busca = busca.replace(/^(video|vídeo|mp4)\s+/i, '').trim();
+            } else if (/^(musica|música|audio|áudio|mp3)\s+/i.test(busca)) {
+                modoVideo = false;
+                busca = busca.replace(/^(musica|música|audio|áudio|mp3)\s+/i, '').trim();
+            }
+            if (!busca) return responder(`🔎 Digite o nome para pesquisar.\nMúsica: *${p}play Blue Bird Naruto*\nVídeo: *${p}play video trailer Naruto*`);
+            if (busca.length > 150) return responder('⚠️ O nome da pesquisa é muito longo.');
+            const ts = Date.now();
+            const saida = path.join(__dirname, modoVideo ? `play_video_${ts}.mp4` : `play_audio_${ts}.mp3`);
+            try {
+                await responder(modoVideo ? `🎬 Procurando vídeo: *${busca}*\n⏳ Qualidade limitada a 480p para funcionar melhor no TV Box.` : `🎵 Procurando música: *${busca}*\n⏳ Aguarde...`);
+                const argumentos = modoVideo
+                    ? ['--no-playlist', '--no-warnings', '--max-filesize', '45M', '-f', 'best[ext=mp4][height<=480]/best[height<=480]/best', '--merge-output-format', 'mp4', '-o', saida, `ytsearch1:${busca}`]
+                    : ['--no-playlist', '--no-warnings', '--max-filesize', '35M', '-x', '--audio-format', 'mp3', '--audio-quality', '7', '-o', saida, `ytsearch1:${busca}`];
+                const binYtDlp = '/data/data/com.termux/files/usr/bin/yt-dlp';
+                await execFileAsync(fs.existsSync(binYtDlp) ? binYtDlp : 'yt-dlp', argumentos, { timeout: 120000, maxBuffer: 5 * 1024 * 1024 });
+                if (!fs.existsSync(saida) || fs.statSync(saida).size < 100) throw new Error('O download não gerou um arquivo válido.');
+                if (modoVideo) {
+                    await sock.sendMessage(from, { video: fs.readFileSync(saida), caption: `🎬 ${busca}` }, { quoted: m });
+                } else {
+                    await sock.sendMessage(from, { audio: fs.readFileSync(saida), mimetype: 'audio/mpeg' }, { quoted: m });
+                }
+            } catch (e) {
+                console.error('[PLAY] Erro yt-dlp:', e.stderr || e.message);
+                await responder('❌ Não consegui encontrar ou baixar esse conteúdo. Tente outro nome e confira se o yt-dlp está atualizado.');
+            } finally {
+                try { if (fs.existsSync(saida)) fs.unlinkSync(saida); } catch (_) {}
+            }
+            return;
+        }
+
+        // ==========================================
+        // ÁUDIO REVERSO (,reverso) E ÁUDIO ACELERADO (,acelerar)
+        // ==========================================
+        if (cmd === 'reverso' || cmd === 'reverse' || cmd === 'audioreverso' || cmd === 'acelerar' || cmd === 'fast' || cmd === 'rapido') {
+            const ehReverso = ['reverso', 'reverse', 'audioreverso'].includes(cmd);
+            const ctx = m.message.extendedTextMessage?.contextInfo;
+            const quoted = ctx?.quotedMessage;
+            const targetMsg = quoted
+                ? {
+                    key: {
+                        remoteJid: from,
+                        fromMe: false,
+                        id: ctx.stanzaId,
+                        participant: ctx.participant
+                    },
+                    message: quoted
+                }
+                : m;
+            const targetType = quoted ? Object.keys(quoted)[0] : tipoMsg;
+
+            if (targetType !== 'audioMessage' && targetType !== 'videoMessage') {
+                return responder(
+                    ehReverso
+                        ? `⚠️ Responda a um *áudio* ou *vídeo* com *${p}reverso* para inverter o som!`
+                        : `⚠️ Responda a um *áudio* ou *vídeo* com *${p}acelerar* (ou *${p}acelerar 1.5* / *2.0*)!`
+                );
+            }
+
+            let velocidade = 1.5;
+            if (!ehReverso && args[0]) {
+                const v = parseFloat(args[0].replace(',', '.'));
+                if (!isNaN(v) && v >= 0.5 && v <= 4.0) {
+                    velocidade = v;
+                } else {
+                    return responder('⚠️ Escolha uma velocidade entre *0.5* e *4.0*! Exemplo: *' + p + 'acelerar 1.8*');
+                }
+            }
+
+            await responder(
+                ehReverso
+                    ? '⏪ Invertendo o áudio de trás para frente...'
+                    : `⏩ Acelerando o áudio em *${velocidade}x*...`
+            );
+
+            const ts = Date.now();
+            const inMidia = path.join(__dirname, `in_fx_${ts}.bin`);
+            const outOgg = path.join(__dirname, `out_fx_${ts}.ogg`);
+
+            try {
+                const buf = await downloadMediaMessage(
+                    targetMsg,
+                    'buffer',
+                    {},
+                    {
+                        logger: pino({ level: 'silent' }),
+                        reuploadRequest: sock.updateMediaMessage
+                    }
+                );
+                fs.writeFileSync(inMidia, buf);
+
+                // Monta filtro atempo encadeado caso velocidade > 2.0 (limite do filtro atempo é 2.0 por estágio)
+                let filtroAudio = 'areverse';
+                if (!ehReverso) {
+                    if (velocidade <= 2.0) {
+                        filtroAudio = `atempo=${velocidade}`;
+                    } else {
+                        const resto = (velocidade / 2.0).toFixed(2);
+                        filtroAudio = `atempo=2.0,atempo=${resto}`;
+                    }
+                }
+
+                const ffCmd = `ffmpeg -y -i "${inMidia}" -vn -af "${filtroAudio}" -c:a libopus -b:a 48k "${outOgg}"`;
+                exec(ffCmd, { timeout: 30000 }, async (err, stdout, stderr) => {
+                    if (fs.existsSync(inMidia)) fs.unlinkSync(inMidia);
+                    if (err || !fs.existsSync(outOgg)) {
+                        console.log('[AUDIO FX] Erro FFmpeg:', stderr || err?.message);
+                        if (fs.existsSync(outOgg)) fs.unlinkSync(outOgg);
+                        return responder('❌ Erro ao processar o áudio. Verifique se a mídia contém som válido.');
+                    }
+                    try {
+                        await sock.sendMessage(from, {
+                            audio: fs.readFileSync(outOgg),
+                            mimetype: 'audio/ogg; codecs=opus',
+                            ptt: true
+                        }, { quoted: m });
+                    } catch (eSend) {
+                        await responder('❌ Erro ao enviar áudio modificado: ' + eSend.message);
+                    } finally {
+                        if (fs.existsSync(outOgg)) fs.unlinkSync(outOgg);
+                    }
+                });
+            } catch (e) {
+                if (fs.existsSync(inMidia)) fs.unlinkSync(inMidia);
+                if (fs.existsSync(outOgg)) fs.unlinkSync(outOgg);
+                await responder('❌ Falha ao baixar a mídia: ' + e.message);
+            }
+            return;
+        }
+
         // ==========================================
         // CRIAR FIGURINHA NORMAL (,s) E DOWNLOAD INTERATIVO (,baixar, ,mp3, ,mp4)
         // ==========================================
